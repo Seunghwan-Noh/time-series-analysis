@@ -1,0 +1,243 @@
+---
+title: "Real Data Analysis by SGD via Random Scaling"
+output: html_document
+date: "2023-12-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(class)
+library(caret)
+library(ROCR)
+library(glmnet)
+```
+
+To assess the predictive performance of Stochastic Gradient Descent (SGD) with random scaling, I will apply the random scaling SGD to the "Mushroom" dataset. This dataset comprises 61,069 observations, each with 2 classes and 20 features. The class labels are are "edible" and "poisonous". The dataset is sourced from <https://archive.ics.uci.edu/dataset/848/secondary+mushroom+dataset.>
+
+## Algorithm
+
+The random scaling SGD algorithm for logistic regression was referenced from the code available on <https://github.com/SGDinference-Lab/AAAI-22>.
+
+"Algorithm1" in the slide is done by the function below. This function updates $A_t$(`a.old` -> `a.new`), $b_t$(`b.old` -> `b.new`), and $\hat{V}_t$. `c.new` denotes $\sum_{s=1}^{t}s^2$ in the "Algorithm". $\beta_t$ is not updated by the function below, but is updated by `beta_estimator` function.
+
+```{r}
+random.scaling.update = function(t.obs, bar.bt_t, a.old, b.old, c.old){
+  
+  a.new = a.old + t.obs^2 * bar.bt_t %*% t(bar.bt_t)
+  b.new = b.old + t.obs^2 * bar.bt_t
+  c.new = c.old + t.obs^2
+  
+  V_t = ( a.new - b.new %*% t(bar.bt_t) - bar.bt_t %*% t(b.new) + c.new * bar.bt_t %*% t(bar.bt_t) ) / (t.obs^2)
+  
+  return(list(a.new=a.new, b.new=b.new, c.new=c.new, V_t=V_t))
+}
+```
+
+To perform SGD, gradient of the objective function is necessary. Below is the gradient for logistic model.
+
+```{r}
+grad_comp = function(x_old, a_new, b_new, d){
+  a_new = matrix(a_new, d, 1)
+  x_old = matrix(x_old, d, 1)
+  grad = -c((2*b_new-1)*a_new) / c(1+exp( (2*b_new-1) * (t(a_new)%*%x_old)) )
+  return (grad)
+}
+```
+
+This function obtains the estimated $\beta$ from the dataset. `data_x` denotes the design matrix and it has a form of $n \times d$ matrix where n is the number of observations and d is the dimension of regressors. `data_y` denotes the response varaible matrix with form of $n \times 1$ vector. `alpha` and `lr` are the hyperparameters of the learning rate. Note that from "Assumption 1" (iv), step size $\gamma_t$ has form of $\gamma_0t^{-a}$ for some $1/2 < a < 1$. `alpha` and `lr` are the same as $a$ and $\gamma_0$, respectively.
+
+```{r}
+beta_estimator = function(data_x, data_y, alpha, lr)
+{
+  #number of observations
+  n = dim(data_x)[1]
+  
+  # Dimension of regressors
+  d = dim(data_x)[2] 
+
+  # Initialize the output variables
+  X = matrix(0, nrow = d, ncol = 1, byrow = TRUE)
+  Xbar_old = matrix(0, nrow = d, ncol = 1, byrow = TRUE)
+  
+  # parameters for Random Scaling method updates
+  a.old = matrix(0, nrow = d, ncol = d)
+  b.old = matrix(0, nrow = d, ncol = 1)
+  c.old = 0
+  
+  for (obs in 1:n){
+    lrnew = lr*obs**(-alpha)
+    grad = grad_comp(X, t(data_x[obs, ]), data_y[obs,], d)
+    X = X - lrnew*grad
+    Xbar_old = (Xbar_old*(obs - 1) + X)/obs
+    
+    rs = random.scaling.update(obs, Xbar_old, a.old, b.old, c.old)
+    a.old = rs$a.new
+    b.old = rs$b.new
+    c.old = rs$c.new
+    S_hat = diag(rs$V_t)
+  }
+  
+  return(Xbar_old) #returns the coefficient estimator
+}
+```
+
+## Data Preprocessing and Exploratory Data Analaysis(EDA)
+
+Since this analysis is not purposed for developing the best classifier for edible/poisonous mushrooms, only a minimum necessary data preprocessing and EDA have been conducted. Explanations for each feature is available on the data repository linked above.
+
+```{r}
+data <- read.csv("secondary_data.csv", sep = ";") #read data
+data <- data %>% 
+  mutate_if(is.numeric, scale) #standaradize numerical variables
+
+data[data == ""] <- NA #"" value is unknowned, so assign NA
+
+(Na_count <- apply(data, 2, function(x) sum(is.na(x))))
+
+#for the sake of convenience, delete columns that have NA values       
+      
+col_names <- names(Na_count)
+col_names <- col_names[Na_count == 0]
+
+data <- data[,col_names]
+
+data <- data %>% 
+  mutate_if(is.character, function(x) as.factor(x)) #factorize 
+
+dim(data)
+```
+
+We now have 61069 observations with 11 features.
+
+We can see that the class labels are not unbalanced.
+
+```{r}
+data %>% 
+  ggplot(aes(x = class)) +
+  geom_bar()
+```
+
+These two features relatively discriminate the two labels well.(not very well)
+
+```{r}
+data %>% 
+  ggplot(aes(x = class, y = stem.width)) +
+  geom_boxplot()
+
+data %>% 
+  ggplot() +
+  geom_bar(aes(x = class, fill = season), position = "fill")
+
+data %>% 
+  ggplot(aes(x = season, y = stem.width, color = class)) +
+  geom_jitter()
+```
+
+## Prediction
+
+We will split the data into train and test by 9:1 and compare the prediction performance of logistic regression estimated by default in R(maximizing conditional likelihood) and by random scaling SGD. Unlike estimating coefficient by maximizing conditional likelihood, random scaling SGD requires tuning hyperparameters. This will be executed by 5-fold cross-validation on the test set.
+
+First, check the performance of default logistic regression.
+
+```{r}
+set.seed(1213)
+#perform one-hot encoding
+dummy <- dummyVars(~., data = data, fullRank = TRUE, sep = "_")
+data <- data.frame(predict(dummy, newdata=data))
+head(data)
+
+n <- dim(data)[1]
+test <- sample(n, n%/%10)
+
+logistic_mod <- glm(class_p ~ ., data[-test,], family = "binomial") #model trained in train data
+
+prob <- predict(logistic_mod, newdata = data[test, -1], type = "response") #obtain the probability for test data
+
+pred_class <- rep(0, length(test))
+pred_class[prob > 0.5] = 1
+
+true_class <- data[test,1]
+
+table(pred_class, true_class) #confusion matrix
+mean(pred_class == true_class) #accuracy
+```
+
+Now, check the performance of random scaling SGD.
+
+```{r, error = T}
+set.seed(1213)
+train_x <- as.matrix(data[-test,-1])
+train_y <- as.matrix(data[-test, 1])
+
+shuffle <- sample(54963, 54963) #to prevent bias due to ordering
+
+train_x <- as.matrix(train_x[shuffle,])
+train_y <- as.matrix(train_y[shuffle,])
+
+#perform 5-fold validation grid search and obtain the best hyperparameters
+
+k_fold_result <- createFolds(train_y, k = 5, list=TRUE, returnTrain = FALSE)
+
+param_grid <- expand.grid(alpha = seq(0.5001, 0.9999, length.out = 20), 
+            lr = seq(5, 12, length.out = 20))
+
+param_grid$acc <- 0
+
+alpha <- param_grid$alpha
+lr <- param_grid$lr
+for(i in 1:400){
+    acc_vec = c() #to obtain 5 accuracies for each fold
+    for(f in 1:5){
+    beta <- beta_estimator(data_x = train_x[-k_fold_result[[f]],], 
+                           data_y = as.matrix(train_y[-k_fold_result[[f]],]),
+                           alpha = alpha[i], 
+                           lr = lr[i])
+    
+    # Calculate the linear combination of predictors and beta 
+    lin_comb <- as.matrix(train_x[k_fold_result[[f]], ]) %*% beta
+    # Apply the logistic function to obtain predicted probabilities
+    prob <- 1 / (1 + exp(-lin_comb))
+    true_class = train_y[k_fold_result[[f]], ]
+    pred_class <- rep(0, length(true_class))
+    pred_class[prob > 0.5] = 1
+    acc_vec[f] = mean(pred_class == true_class)
+    }
+  param_grid[i,3] = mean(acc_vec) #mean accuracy
+}
+
+#obtain the best hyperparameters
+
+tmp <- param_grid %>% 
+  arrange(desc(acc)) %>% 
+  .[1,]
+
+alpha_optim <- tmp[1,1]; lr_optim <- tmp[1,2]
+
+#obtain the coefficient estimator by using the hyperparameters above
+
+beta <- beta_estimator(data_x = train_x, 
+                           data_y = as.matrix(train_y),
+                           alpha = alpha_optim, 
+                           lr = lr_optim)
+    
+# Calculate the linear combination of predictors and beta 
+lin_comb <- as.matrix(data[test, -1]) %*% beta
+
+# Apply the logistic function to obtain predicted probabilities
+prob <- 1 / (1 + exp(-lin_comb))
+pred_class <- rep(0, length(test))
+pred_class[prob > 0.5] = 1
+true_class <- data[test,1]
+table(pred_class, true_class) #confusion matrix
+mean(pred_class == true_class) #accuracy
+```
+
+It is almost sure that other classification methods such as LASSO will perform better in this case. Also there is no significant enhancement in accuracy with random scaling SGD. However, it is notable that random scaling SGD has strongness in inference and shows moderate performance in real data prediction. If random scaling SGD is applied to more sophisticated models, it may outperform other models in prediction as well.
+
+
+
+
+
+
+
